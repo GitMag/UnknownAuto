@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  UnknownAuto — installs an APK you already have with the Google Play install-source
+  attribution, so Android Auto accepts a self-built Car App Library app in a real car.
+  Our own, open, offline replacement for the third-party "AA Enabler".
+  No internet, no accounts, no payment, no Shizuku. See README.md.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.mag.unknownauto"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <!-- Install an APK through the system package installer. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- Read the target's install-source back, to verify the result. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+    <!-- Drive the install as the shell user through Shizuku (phone-only, no computer). -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23"/>
+    <!-- Download the official Shizuku APK when it is not installed. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <queries>
+        <package android:name="moe.shizuku.privileged.api"/>
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:label="UnknownAuto"
+        android:icon="@android:drawable/stat_sys_download_done"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <activity
+            android:name=".InstallActivity"
+            android:exported="true"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <!-- Open an .apk "with UnknownAuto" from a file manager. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:scheme="content"/>
+                <data android:scheme="file"/>
+                <data android:mimeType="application/vnd.android.package-archive"/>
+            </intent-filter>
+        </activity>
+
+        <!-- Serves the staged APK to the system installer as a content:// URI. -->
+        <provider
+            android:name=".ApkProvider"
+            android:authorities="com.mag.unknownauto.apk"
+            android:exported="false"
+            android:grantUriPermissions="true"/>
+
+        <!-- Shizuku client: receives the Shizuku binder so we can bind the user service. -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="com.mag.unknownauto.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"/>
+        <meta-data android:name="moe.shizuku.client.V3_SUPPORT" android:value="true"/>
+    </application>
+</manifest>

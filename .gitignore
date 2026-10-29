@@ -1,0 +1,15 @@
+# build output (recreated by build.sh)
+build/
+*.apk
+*.apk.idsig
+*.idsig
+
+# fetched Shizuku libraries (build.sh re-downloads them)
+libs/
+
+# signing key — generated locally by build.sh, never commit
+keys/
+*.keystore
+*.jks
+
+.DS_Store
