@@ -1,12 +1,11 @@
 # UnknownAuto
 
+[![Download APK](https://img.shields.io/github/v/release/GitMag/UnknownAuto?label=download%20APK&logo=android&color=success)](https://github.com/GitMag/UnknownAuto/releases/latest)
+
 An open, offline tool that lets a **self‑built or sideloaded Android Auto app** actually
 run in the car. It installs an APK the way Android Auto requires — as if it came from
 Google Play — **entirely on the phone, no computer**. No internet, no account, no payment,
 no analytics. A free, open alternative to the proprietary *AA Enabler*.
-
-> Personal‑use interoperability tool. You own the phone, the car and the app. See the
-> legal note at the end.
 
 <p align="center"><img src="docs/screenshot.png" alt="UnknownAuto" width="300"></p>
 
@@ -34,7 +33,8 @@ Shizuku for the complete result.
 
 ## Install UnknownAuto
 
-Plain Android SDK tools, no Gradle:
+Grab **UnknownAuto‑1.0.apk** from the [latest release](https://github.com/GitMag/UnknownAuto/releases/latest)
+and open it on the phone — or build it yourself with plain Android SDK tools, no Gradle:
 
 ```
 ./build.sh            # build unknownauto.apk
@@ -62,15 +62,6 @@ Then, for any app you want in the car:
 
 The technical output is tucked behind a **Show details** toggle; the result banner is
 always visible.
-
-## Legal note (personal use, EU)
-
-You own the phone, the car and the app, and this just makes your own app work with Android
-Auto on your own hardware — protected as reverse engineering for interoperability (EU
-Software Directive 2009/24/EC, Art. 6). The one caveat: presenting the install as coming
-from Google Play likely breaks Google's Android Auto terms of service — a contract matter,
-not a legal one, and negligible for a single personal device. Don't redistribute apps
-installed this way.
 
 ## License
 
