@@ -2,6 +2,7 @@ package com.mag.unknownauto;
 
 import android.content.Context;
 
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 
 /**
@@ -25,17 +26,26 @@ public final class ShellService extends IShellService.Stub {
     }
 
     @Override
-    public int exec(String[] cmd) {
+    public String run(String[] cmd) {
         try {
             Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
             InputStream in = p.getInputStream();
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
             byte[] buf = new byte[4096];
-            while (in.read(buf) >= 0) {
-                // drain so the child can exit
+            int n;
+            while ((n = in.read(buf)) >= 0) {
+                // drain so the child can exit; keep at most 256 kB (a binder reply is small)
+                if (out.size() < MAX_OUTPUT) {
+                    out.write(buf, 0, Math.min(n, MAX_OUTPUT - out.size()));
+                }
             }
-            return p.waitFor();
+            int code = p.waitFor();
+            String s = out.toString("UTF-8");
+            return code == 0 ? s : s + "\n[exit " + code + "]";
         } catch (Throwable t) {
-            return -1;
+            return null;
         }
     }
+
+    private static final int MAX_OUTPUT = 256 * 1024;
 }
