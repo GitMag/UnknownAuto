@@ -4,10 +4,12 @@ import android.app.Activity;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.InstallSourceInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.Signature;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.net.Uri;
@@ -31,6 +33,10 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.text.SimpleDateFormat;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.Locale;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -80,9 +86,21 @@ public final class InstallActivity extends Activity {
     private String targetPackage;   // package name parsed from the staged APK
     private String stagedLabel;     // app label of the staged APK
     private File staged;            // cacheDir/install.apk
+    private PackageInfo stagedInfo; // the staged APK as parsed (version, signing key)
+    private long installedBefore;   // target's lastUpdateTime before this install; 0 = absent
+    private long installStartedAt;  // when the installer was launched (start of its log)
     private boolean awaitingBinder; // staged and waiting for Shizuku's binder to connect
     private boolean verifyPending;  // an install was launched; verify when we come back
     private boolean sawPause;       // the installer actually took the foreground
+    private boolean viaShell;       // this attempt launched the installer as shell (Shizuku)
+    private boolean retried;        // this install already tried the other launch path
+
+    /**
+     * Remembered per phone: whether the installer keeps the Play mark when the shell
+     * starts it (true on current Android) or only when an app without INSTALL_PACKAGES
+     * does (some Android 17 builds have that check inverted).
+     */
+    private static final String SHELL_KEEPS_MARK = "shellKeepsMark";
 
     private final Shizuku.OnBinderReceivedListener binderListener =
             new Shizuku.OnBinderReceivedListener() {
@@ -99,6 +117,7 @@ public final class InstallActivity extends Activity {
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         buildUi();
+        print(deviceLine());
         try {
             Shizuku.addBinderReceivedListenerSticky(binderListener);
         } catch (Throwable ignore) {
@@ -133,6 +152,19 @@ public final class InstallActivity extends Activity {
             banner.setVisibility(View.GONE);
         }
         print("Ready. Tap “Install” to install " + stagedLabel + " for Android Auto.");
+    }
+
+    /** Phone, Android version and installer version: what a bug report needs first. */
+    private String deviceLine() {
+        String pi;
+        try {
+            pi = getPackageManager().getPackageInfo("com.google.android.packageinstaller", 0)
+                    .versionName;
+        } catch (Throwable t) {
+            pi = "?";
+        }
+        return Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE
+                + " (SDK " + Build.VERSION.SDK_INT + "), package installer " + pi + "\n";
     }
 
     /** Grants read on the staged-APK URI to the system package installers. */
@@ -200,12 +232,14 @@ public final class InstallActivity extends Activity {
             clearStaged();
             return false;
         }
-        PackageInfo pi = getPackageManager().getPackageArchiveInfo(staged.getAbsolutePath(), 0);
+        PackageInfo pi = getPackageManager().getPackageArchiveInfo(staged.getAbsolutePath(),
+                signingFlag());
         if (pi == null) {
             print("Not a valid APK: " + src, Color.RED);
             clearStaged();
             return false;
         }
+        stagedInfo = pi;
         targetPackage = pi.packageName;
         stagedLabel = targetPackage;
         try {
@@ -237,6 +271,78 @@ public final class InstallActivity extends Activity {
         return false;
     }
 
+    // --- before installing: refuse what Android would refuse anyway ---------
+
+    /**
+     * Notes the target's current install time (so verify() can tell "not installed"
+     * from "installed without the Play mark") and stops installs Android would refuse
+     * anyway — a downgrade or a different signing key — with the fix. Without this the
+     * installer fails, the old sideload record stays, and it looks like a rejection.
+     */
+    private boolean preflight() {
+        PackageInfo old = installedInfo(targetPackage);
+        installedBefore = old != null ? old.lastUpdateTime : 0;
+        if (old == null) {
+            return true;
+        }
+        String label = labelFor(targetPackage);
+        print("Already installed: v" + old.versionName + " (installer "
+                + installerOf(targetPackage) + ")");
+        if (versionCode(old) > versionCode(stagedInfo)) {
+            showBanner("✖  A newer " + label + " (v" + old.versionName + ") is installed\n"
+                    + "Uninstall it first, then install this one.", Color.RED);
+            print("✖ Android does not install an older version over a newer one.", Color.RED);
+            return false;
+        }
+        if (!sameSigner(stagedInfo, old)) {
+            showBanner("✖  The installed " + label + " is signed with another key\n"
+                    + "Uninstall it first (its data is lost), then install.", Color.RED);
+            print("✖ Android only updates an app with an APK signed by the same key.", Color.RED);
+            return false;
+        }
+        return true;
+    }
+
+    private static int signingFlag() {
+        return Build.VERSION.SDK_INT >= 28 ? PackageManager.GET_SIGNING_CERTIFICATES : 0;
+    }
+
+    private PackageInfo installedInfo(String pkg) {
+        try {
+            return getPackageManager().getPackageInfo(pkg, signingFlag());
+        } catch (PackageManager.NameNotFoundException e) {
+            return null;
+        }
+    }
+
+    private String installerOf(String pkg) {
+        try {
+            return Build.VERSION.SDK_INT >= 30
+                    ? getPackageManager().getInstallSourceInfo(pkg).getInstallingPackageName()
+                    : getPackageManager().getInstallerPackageName(pkg);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static long versionCode(PackageInfo pi) {
+        return Build.VERSION.SDK_INT >= 28 ? pi.getLongVersionCode() : pi.versionCode;
+    }
+
+    /** True if the new APK can update the installed one (same key, or a rotation of it). */
+    private static boolean sameSigner(PackageInfo apk, PackageInfo installed) {
+        if (Build.VERSION.SDK_INT < 28 || apk.signingInfo == null
+                || installed.signingInfo == null) {
+            return true; // can't tell: let the installer decide
+        }
+        Signature[] current = installed.signingInfo.getApkContentsSigners();
+        Signature[] accepted = apk.signingInfo.hasMultipleSigners()
+                ? apk.signingInfo.getApkContentsSigners()
+                : apk.signingInfo.getSigningCertificateHistory();
+        return Arrays.asList(accepted).containsAll(Arrays.asList(current));
+    }
+
     // --- the actual install ------------------------------------------------
 
     private void launchInstaller() {
@@ -265,6 +371,8 @@ public final class InstallActivity extends Activity {
         try {
             verifyPending = true;
             sawPause = false;
+            viaShell = false;
+            installStartedAt = System.currentTimeMillis();
             startActivityForResult(in, REQ_INSTALL);
             print("Tap “Install” on the phone…");
         } catch (Exception e) {
@@ -369,27 +477,49 @@ public final class InstallActivity extends Activity {
 
     private void runViaShizuku() {
         grantToInstallers(ApkProvider.uriFor());
+        print("asking Shizuku to run the installer as shell…");
+        print("tap Update / Install if it asks (and “Install anyway” if Play Protect asks)…");
+        verifyPending = true;
+        sawPause = false;
+        viaShell = true;
+        installStartedAt = System.currentTimeMillis();
+        shell(installerCommand(), out -> {
+            if (out == null || out.contains("Error") || out.contains("[exit ")) {
+                print("Installer launch failed: " + out, Color.RED);
+            } else {
+                print("Installer launched as shell.");
+            }
+        });
+    }
+
+    private interface ShellDone {
+        void done(String output); // null = could not run
+    }
+
+    /** Runs argv as the shell user through Shizuku; done gets its output on the UI thread. */
+    private void shell(final String[] cmd, final ShellDone done) {
         final Shizuku.UserServiceArgs args = new Shizuku.UserServiceArgs(
                 new ComponentName(getPackageName(), ShellService.class.getName()))
-                .daemon(false).processNameSuffix("shell").debuggable(false).version(1);
+                .daemon(false).processNameSuffix("shell").debuggable(false).version(2);
         final ServiceConnection conn = new ServiceConnection() {
             @Override
-            public void onServiceConnected(ComponentName name, IBinder binder) {
-                int code;
-                try {
-                    code = IShellService.Stub.asInterface(binder).exec(installerCommand());
-                } catch (Throwable t) {
-                    code = -1;
-                }
-                final int c = code;
-                runOnUiThread(() -> print(c == 0
-                        ? "Installer launched as shell — tap Update when it appears."
-                        : "Installer launch exit code " + c + ".", Color.DKGRAY));
-                try {
-                    Shizuku.unbindUserService(args, this, true);
-                } catch (Throwable ignore) {
-                    // best effort
-                }
+            public void onServiceConnected(ComponentName name, final IBinder binder) {
+                final ServiceConnection self = this;
+                new Thread(() -> {
+                    String out;
+                    try {
+                        out = IShellService.Stub.asInterface(binder).run(cmd);
+                    } catch (Throwable t) {
+                        out = null;
+                    }
+                    final String o = out;
+                    runOnUiThread(() -> done.done(o));
+                    try {
+                        Shizuku.unbindUserService(args, self, true);
+                    } catch (Throwable ignore) {
+                        // best effort
+                    }
+                }).start();
             }
 
             @Override
@@ -397,15 +527,92 @@ public final class InstallActivity extends Activity {
             }
         };
         try {
-            print("asking Shizuku to run the installer as shell…");
-            print("tap Update / Install (and “Install anyway” if Play Protect asks)…");
-            verifyPending = true;
-            sawPause = false;
             Shizuku.bindUserService(args, conn);
         } catch (Throwable t) {
             print("Shizuku bind failed: " + t.getMessage(), Color.RED);
         }
     }
+
+    private boolean shizukuReady() {
+        try {
+            return Shizuku.pingBinder() && !Shizuku.isPreV11()
+                    && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * The install went through but lost the Play mark: try once more, launching the
+     * installer the other way. Current Android keeps the mark only when the shell starts
+     * the installer; some Android 17 builds have that check inverted and keep it only
+     * when an app without INSTALL_PACKAGES (UnknownAuto itself) does. Returns false if
+     * the other way isn't available.
+     */
+    private boolean tryOtherPath(PackageInfo now) {
+        if (!viaShell && !shizukuReady()) {
+            return false; // the app path asks for its permission itself; the shell needs Shizuku
+        }
+        retried = true;
+        installedBefore = now.lastUpdateTime;
+        print("The installer dropped the Play mark when started "
+                + (viaShell ? "as shell" : "by UnknownAuto")
+                + ". Some Android builds keep it only the other way; trying that once…",
+                Color.rgb(0xB0, 0x60, 0x00));
+        showBanner("…  One more step\nConfirm the update once more.",
+                Color.rgb(0xB0, 0x60, 0x00));
+        if (!viaShell) {
+            runViaShizuku();
+        } else if (ensureInstallPermission()) {
+            launchInstaller();
+        }
+        return true;
+    }
+
+    private SharedPreferences prefs() {
+        return getSharedPreferences("unknownauto", MODE_PRIVATE);
+    }
+
+    /**
+     * Prints the package installer's own log lines since the install began — the reason
+     * an install was cancelled, blocked or lost its Play mark. Only the shell can read
+     * other apps' logs, so this needs Shizuku.
+     */
+    private void printInstallerLog() {
+        if (!shizukuReady()) {
+            print("(Start Shizuku to see the installer's own reason here.)");
+            return;
+        }
+        String since = new SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
+                .format(new Date(installStartedAt - 2000));
+        // Package names are [A-Za-z0-9_.] only, so it is safe inside the quoted pattern.
+        String pattern = INSTALLER_LOG + "| PackageManager *:.*(" + targetPackage
+                + "|INSTALL_FAILED)";
+        shell(new String[]{"/system/bin/sh", "-c", "logcat -d -t '" + since + "' | grep -E '"
+                + pattern + "'"}, out -> {
+            print("\ninstaller log:");
+            String[] lines = out == null ? new String[0] : out.trim().split("\n");
+            int from = Math.max(0, lines.length - 40); // the last 40 lines hold the outcome
+            for (int i = from; i < lines.length; i++) {
+                String l = lines[i];
+                if (!l.isEmpty() && !l.startsWith("[exit ")) {
+                    print(l.length() > 240 ? l.substring(0, 240) + "…" : l, Color.DKGRAY);
+                }
+            }
+            if (lines.length == 0 || lines[0].isEmpty() || lines[0].startsWith("[exit ")) {
+                print("(nothing logged by the installer)");
+            }
+        });
+    }
+
+    /**
+     * Log tags of the platform installer, and words of install failures and Play Protect.
+     * The package manager is too chatty for its tag alone; printInstallerLog() adds its
+     * lines only when they name the target package or a failure.
+     */
+    private static final String INSTALLER_LOG = " (InstallStart|InstallRepository|InstallStaging"
+            + "|InstallInstalling|InstallLaunch|PackageInstaller|PackageInstallerSession) *:"
+            + "|INSTALL_FAILED|VerifyApps|Play Protect";
 
     /** argv the shell runs: launch the Google installer against our content URI, Play-tagged. */
     private String[] installerCommand() {
@@ -576,6 +783,14 @@ public final class InstallActivity extends Activity {
         if (targetPackage == null) {
             return;
         }
+        PackageInfo now = installedInfo(targetPackage);
+        if (now == null) {
+            showBanner("✖  " + (stagedLabel != null ? stagedLabel : targetPackage)
+                    + " is not installed\nThe install was cancelled or refused — see details.",
+                    Color.RED);
+            printInstallerLog();
+            return;
+        }
         try {
             String initiating = null;
             String installer;
@@ -595,11 +810,27 @@ public final class InstallActivity extends Activity {
                         Color.rgb(0x1B, 0x7A, 0x1B));
                 toast(label + " installed — Android Auto will accept it");
                 print("✔ Android Auto will accept " + targetPackage, Color.rgb(0x1B, 0x7A, 0x1B));
+                prefs().edit().putBoolean(SHELL_KEEPS_MARK, viaShell).apply();
+            } else if (now.lastUpdateTime == installedBefore) {
+                // Nothing was installed: what we read is the old (sideload) record.
+                showBanner("✖  " + label + " was not installed\n"
+                        + "The install was cancelled or refused — see details.", Color.RED);
+                print("✖ nothing was installed — " + label + " still has its old install "
+                        + "record (installer=" + installer + ")", Color.RED);
+                printInstallerLog();
             } else {
-                showBanner("✖  Not accepted yet\nTap “Install for Android Auto” again.",
-                        Color.RED);
-                print("✖ still rejected (initiator=" + initiating + ", installer="
-                        + installer + ")", Color.RED);
+                print("✖ installed without the Play mark (initiator=" + initiating
+                        + ", installer=" + installer + ")", Color.RED);
+                if (!retried && tryOtherPath(now)) {
+                    return;
+                }
+                showBanner("✖  Installed, but without the Google Play mark\n"
+                        + "Android Auto won't accept it — see details.", Color.RED);
+                if (!viaShell && !shizukuReady()) {
+                    print("Start Shizuku and tap Install again: this phone needs the "
+                            + "installer started as shell.", Color.rgb(0xB0, 0x60, 0x00));
+                }
+                printInstallerLog();
             }
         } catch (PackageManager.NameNotFoundException e) {
             showBanner("✖  " + targetPackage + " is not installed", Color.RED);
@@ -630,6 +861,7 @@ public final class InstallActivity extends Activity {
     /** Drops any loaded APK and disables the Install button (e.g. after a failed load). */
     private void clearStaged() {
         staged = null;
+        stagedInfo = null;
         targetPackage = null;
         stagedLabel = null;
         updateInstallButton();
@@ -719,7 +951,16 @@ public final class InstallActivity extends Activity {
                     return;
                 }
                 banner.setVisibility(View.GONE);
-                if (!tryShizukuInstall() && ensureInstallPermission()) {
+                retried = false;
+                if (!preflight()) {
+                    return;
+                }
+                // Shell first (what current Android keeps the mark for), unless this phone
+                // already showed that only the app path keeps it.
+                if (prefs().getBoolean(SHELL_KEEPS_MARK, true) && tryShizukuInstall()) {
+                    return;
+                }
+                if (ensureInstallPermission()) {
                     launchInstaller();
                 }
             }
