@@ -59,7 +59,7 @@ import rikka.shizuku.Shizuku;
  * installer name to {@code com.android.vending} and the referrer to Google Play
  * in the install intent. The user taps "Install" once.
  *
- * <p>Result on Android 17 (verified on a Pixel 9):
+ * <p>Result on Android 17 (verified on a Pixel 9) and Android 14 (emulator):
  * <pre>
  *   initiatingPackageName = com.google.android.packageinstaller   (Android Auto wants this)
  *   installerPackageName  = com.android.vending                    (set by the intent extra)
@@ -476,6 +476,16 @@ public final class InstallActivity extends Activity {
     };
 
     private void runViaShizuku() {
+        // Android 14 and older take the installer's caller from who waits for its result,
+        // and `am start` waits for none: the installer then checks the shell itself, which
+        // never declares REQUEST_INSTALL_PACKAGES, and aborts. There the shell starts it
+        // with this activity as the result target instead: the caller is UnknownAuto (it
+        // declares the permission, so it needs "Install unknown apps") and the launcher is
+        // the shell (so the Play name is kept). Android 15+ checks the launcher only.
+        final boolean asResult = Build.VERSION.SDK_INT <= 34;
+        if (asResult && !ensureInstallPermission()) {
+            return;
+        }
         grantToInstallers(ApkProvider.uriFor());
         print("asking Shizuku to run the installer as shell…");
         print("tap Update / Install if it asks (and “Install anyway” if Play Protect asks)…");
@@ -483,6 +493,19 @@ public final class InstallActivity extends Activity {
         sawPause = false;
         viaShell = true;
         installStartedAt = System.currentTimeMillis();
+        if (asResult) {
+            final Intent in = shellInstallIntent();
+            final IBinder self = getWindow().getAttributes().token; // this activity's token
+            withShell(s -> s.startForResult(in, self, REQ_INSTALL), out -> {
+                if ("ok".equals(out)) {
+                    print("Installer launched as shell.");
+                } else {
+                    verifyPending = false;
+                    print("Installer launch failed: " + out, Color.RED);
+                }
+            });
+            return;
+        }
         shell(installerCommand(), out -> {
             if (out == null || out.contains("Error") || out.contains("[exit ")) {
                 print("Installer launch failed: " + out, Color.RED);
@@ -496,11 +519,23 @@ public final class InstallActivity extends Activity {
         void done(String output); // null = could not run
     }
 
+    private interface ShellCall {
+        String call(IShellService s) throws Exception;
+    }
+
     /** Runs argv as the shell user through Shizuku; done gets its output on the UI thread. */
     private void shell(final String[] cmd, final ShellDone done) {
+        withShell(s -> s.run(cmd), done);
+    }
+
+    /**
+     * Binds the shell-user service through Shizuku and makes one call on it; done gets
+     * its return value on the UI thread (null also when the call itself failed).
+     */
+    private void withShell(final ShellCall call, final ShellDone done) {
         final Shizuku.UserServiceArgs args = new Shizuku.UserServiceArgs(
                 new ComponentName(getPackageName(), ShellService.class.getName()))
-                .daemon(false).processNameSuffix("shell").debuggable(false).version(2);
+                .daemon(false).processNameSuffix("shell").debuggable(false).version(3);
         final ServiceConnection conn = new ServiceConnection() {
             @Override
             public void onServiceConnected(ComponentName name, final IBinder binder) {
@@ -508,7 +543,7 @@ public final class InstallActivity extends Activity {
                 new Thread(() -> {
                     String out;
                     try {
-                        out = IShellService.Stub.asInterface(binder).run(cmd);
+                        out = call.call(IShellService.Stub.asInterface(binder));
                     } catch (Throwable t) {
                         out = null;
                     }
@@ -628,6 +663,23 @@ public final class InstallActivity extends Activity {
                 "--ei", "android.intent.extra.INSTALL_REASON", "1",
                 "--es", "android.intent.extra.REFERRER_NAME", "android-app://" + VENDING
         };
+    }
+
+    /**
+     * The same launch as {@link #installerCommand()}, as an Intent the shell starts for a
+     * result. No URI-grant flag: the shell can't grant our URI (grantToInstallers did).
+     */
+    private Intent shellInstallIntent() {
+        Intent in = new Intent(Intent.ACTION_INSTALL_PACKAGE);
+        in.setComponent(new ComponentName("com.google.android.packageinstaller",
+                "com.android.packageinstaller.InstallStart"));
+        in.setDataAndType(ApkProvider.uriFor(), "application/vnd.android.package-archive");
+        in.putExtra("android.intent.extra.INSTALLER_PACKAGE_NAME", VENDING);
+        in.putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true);
+        in.putExtra("android.intent.extra.INSTALL_REASON", 1);
+        in.putExtra(Intent.EXTRA_REFERRER_NAME, "android-app://" + VENDING);
+        in.putExtra(Intent.EXTRA_RETURN_RESULT, true);
+        return in;
     }
 
     // --- get Shizuku onto the phone (when it is not installed) --------------

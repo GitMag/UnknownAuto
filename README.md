@@ -33,13 +33,17 @@ starts the installer itself. When an install comes out without the mark, Unknown
 once more the other way (one more tap on **Update**) and remembers which way works on that
 phone. Start Shizuku so both ways are available.
 
+Android 14 and older also check the app that asked for the install, and refuse the shell
+itself. There Shizuku starts the installer on UnknownAuto's behalf, so UnknownAuto needs the
+**install unknown apps** permission for this too.
+
 If the install doesn't go through at all, for example a newer version or one signed with
 another key is already installed, UnknownAuto says so, and **Show details** includes the
 installer's own log lines, which is the most useful thing to paste into an issue.
 
 ## Install UnknownAuto
 
-Grab **UnknownAuto‑1.1.apk** from the [latest release](https://github.com/GitMag/UnknownAuto/releases/latest)
+Grab **UnknownAuto‑1.2.apk** from the [latest release](https://github.com/GitMag/UnknownAuto/releases/latest)
 and open it on the phone — or build it yourself with plain Android SDK tools, no Gradle:
 
 ```
