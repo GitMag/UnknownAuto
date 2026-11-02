@@ -1,6 +1,7 @@
 # UnknownAuto
 
 [![Download APK](https://img.shields.io/github/v/release/GitMag/UnknownAuto?label=download%20APK&logo=android&color=success)](https://github.com/GitMag/UnknownAuto/releases/latest)
+[![Support on Ko-fi](https://img.shields.io/badge/support-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/forsblomdev)
 
 An open, offline tool that lets a **self‑built or sideloaded Android Auto app** actually
 run in the car. It installs an APK the way Android Auto requires — as if it came from
@@ -43,7 +44,7 @@ installer's own log lines, which is the most useful thing to paste into an issue
 
 ## Install UnknownAuto
 
-Grab **UnknownAuto‑1.2.apk** from the [latest release](https://github.com/GitMag/UnknownAuto/releases/latest)
+Grab **UnknownAuto‑1.3.apk** from the [latest release](https://github.com/GitMag/UnknownAuto/releases/latest)
 and open it on the phone — or build it yourself with plain Android SDK tools, no Gradle:
 
 ```
@@ -118,6 +119,11 @@ For any app you want in the car:
 
 The technical output is tucked behind a **Show details** toggle; the result banner is
 always visible.
+
+## Support
+
+UnknownAuto is free and stays free. If it got your app into the car and you'd like to say
+thanks, you can [buy me a coffee on Ko‑fi](https://ko-fi.com/forsblomdev).
 
 ## License
 

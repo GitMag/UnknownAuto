@@ -75,6 +75,7 @@ import rikka.shizuku.Shizuku;
 public final class InstallActivity extends Activity {
 
     private static final String VENDING = "com.android.vending";
+    private static final String KOFI_URL = "https://ko-fi.com/forsblomdev";
     private static final int REQ_INSTALL = 1;
     private static final int REQ_PICK = 2;
     private static final int REQ_SHIZUKU = 3000;
@@ -1053,10 +1054,33 @@ public final class InstallActivity extends Activity {
         lp.bottomMargin = dp(8);
         root.addView(scroll, lp);
 
+        // Keeps the support link at the bottom while the details are hidden.
+        final View spacer = new View(this);
+        root.addView(spacer, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        TextView support = new TextView(this);
+        support.setText("♥ Support UnknownAuto on Ko-fi");
+        support.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        support.setTextColor(Color.rgb(0xC0, 0x3A, 0x3A));
+        support.setGravity(Gravity.CENTER);
+        support.setPadding(0, dp(12), 0, dp(12)); // a comfortable tap target
+        support.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                try {
+                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(KOFI_URL)));
+                } catch (Exception e) {
+                    toast(KOFI_URL);
+                }
+            }
+        });
+        root.addView(support);
+
         details.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
                 boolean show = scroll.getVisibility() != View.VISIBLE;
                 scroll.setVisibility(show ? View.VISIBLE : View.GONE);
+                spacer.setVisibility(show ? View.GONE : View.VISIBLE);
                 details.setText(show ? "Hide details ▴" : "Show details ▾");
                 if (show) {
                     scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
