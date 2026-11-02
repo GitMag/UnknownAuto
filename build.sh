@@ -39,7 +39,7 @@ $BT/aapt2 link -o build/base.apk -I "$JAR" \
     --min-sdk-version 26 --target-sdk-version 35
 
 # AIDL -> generated Java (the Shizuku user-service interface)
-$BT/aidl -I src -o build/gen src/com/mag/unknownauto/IShellService.aidl
+$BT/aidl -p "$SDK/platforms/android-35/framework.aidl" -I src -o build/gen src/com/mag/unknownauto/IShellService.aidl
 
 javac --release 17 -nowarn -Xlint:-options -encoding UTF-8 -classpath "$JAR:$LIBS" \
     -d build/classes $(find src build/gen -name '*.java')
