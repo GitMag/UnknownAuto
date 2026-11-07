@@ -5,9 +5,13 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.ParcelFileDescriptor;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 
@@ -96,6 +100,55 @@ public final class ShellService extends IShellService.Stub {
         }
     }
 
+    /**
+     * Writes an expansion file into {@code /storage/emulated/<user>/Android/obb/<package>/},
+     * which the shell may write and an app may not. Through a ".part" file and a rename, so
+     * a game never sees half a file. Refuses any other destination.
+     */
+    @Override
+    public String copyIn(ParcelFileDescriptor src, String dest) {
+        File out = new File(dest);
+        File dir = out.getParentFile();
+        String obbRoot = dir != null && dir.getParentFile() != null
+                ? dir.getParentFile().getPath() : "";
+        if (!OBB_ROOT.matcher(obbRoot).matches() || dest.contains("/../")
+                || out.getName().startsWith(".")) {
+            closeQuietly(src);
+            return "refused: " + dest;
+        }
+        File part = new File(dir, out.getName() + ".part");
+        try (InputStream in = new ParcelFileDescriptor.AutoCloseInputStream(src)) {
+            if (!dir.isDirectory() && !dir.mkdirs()) {
+                return "cannot create " + dir;
+            }
+            try (OutputStream os = new FileOutputStream(part)) {
+                byte[] buf = new byte[1 << 16];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    os.write(buf, 0, n);
+                }
+            }
+            if (out.exists() && !out.delete()) {
+                part.delete();
+                return "cannot replace " + out;
+            }
+            return part.renameTo(out) ? "ok" : "cannot rename " + part;
+        } catch (Throwable t) {
+            part.delete();
+            return String.valueOf(t);
+        }
+    }
+
+    private static void closeQuietly(ParcelFileDescriptor p) {
+        try {
+            p.close();
+        } catch (Throwable ignore) {
+            // nothing to do
+        }
+    }
+
+    private static final java.util.regex.Pattern OBB_ROOT =
+            java.util.regex.Pattern.compile("/storage/emulated/[0-9]+/Android/obb");
     private static final String SHELL = "com.android.shell";
     private static final int MAX_OUTPUT = 256 * 1024;
 }

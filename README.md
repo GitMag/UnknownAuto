@@ -110,15 +110,52 @@ kept: turn Wireless debugging on again and tap **Start** in Shizuku. No new code
 
 For any app you want in the car:
 
-1. **Load APK…** — pick the APK of the app you want in the car, e.g. one you built or
-   downloaded (or open that `.apk` with UnknownAuto). It shows the app's name, package and
-   version. It doesn't install yet.
+1. **Load APK or XAPK…** — pick the APK of the app you want in the car, e.g. one you built
+   or downloaded (or open that `.apk` or `.xapk` with UnknownAuto). It shows the app's
+   name, package and version. It doesn't install yet.
 2. **Install** — tap it, confirm the system install prompt once, and UnknownAuto shows a
    big ✔ / ✘ banner telling you whether Android Auto will accept the app. If Play Protect
    offers to scan the app, choose **More details → Install without scanning**.
 
 The technical output is tucked behind a **Show details** toggle; the result banner is
 always visible.
+
+### XAPK files
+
+An `.xapk` is a zip that holds an app's APKs and, for some games, extra data (OBB files).
+UnknownAuto reads it like this:
+
+- **One APK inside:** installed exactly like that APK, with the Google Play mark. The OBB
+  files are then copied to `Android/obb/<package>/`.
+- **Split into several APKs** (`config.arm64_v8a`, `config.xxhdpi`, `config.en`, …):
+  installed together as one app. On a **rooted phone** UnknownAuto gets even a split the
+  full Google Play mark (see below), so Android Auto accepts it. **Without root** it installs
+  the splits through its own installer, which Android won't give the Play mark — Android Auto
+  then shows the app only with *Unknown sources* on in its developer settings, and not at all
+  if it's a Car App Library app. The banner says which case you got. Splits for CPU types the
+  phone doesn't have are left out.
+
+### Rooted phones
+
+A single APK gets the Play mark on any phone (installer screen launched as shell). A **split**
+XAPK can't go through that screen — it takes only one APK — so Android normally can't mark a
+split. On a **rooted** phone UnknownAuto gets around this: it creates the install session
+**under Google Play's own account** (`su <play-uid> pm install-create -i com.android.vending`),
+then writes the APKs and commits as **root**. Android records Play as both the *initiating* and
+the *installing* package, so the result is a normal, Play‑marked install of a multi‑APK app,
+OBB files placed, no taps. (Writing and committing run as root because a session's owner can't
+stream an APK from a pipe, and the install source is fixed when the session is created, so
+committing as root doesn't change it.)
+
+The first install asks the root manager (Magisk etc.) to grant UnknownAuto root — choose
+allow. A non‑rooted phone never sees a root prompt and falls back to the unmarked split
+install. If Google Play isn't installed, it falls back to a root `pm install -i
+com.android.vending`, which sets the Play *installer* name but leaves the shell as the
+initiator — enough for simpler "from Play" checks, not for Android Auto on Android 11+.
+
+For your own Car App Library app you don't need root: build **one** APK rather than splits,
+e.g. from an app bundle with `bundletool build-apks --mode=universal`. Only install XAPKs
+from sources you trust.
 
 ## Support
 

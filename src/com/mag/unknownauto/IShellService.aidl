@@ -3,6 +3,7 @@
 package com.mag.unknownauto;
 
 import android.content.Intent;
+import android.os.ParcelFileDescriptor;
 
 interface IShellService {
     // Shizuku convention: destroy() must use this transaction id so unbind can stop it.
@@ -13,4 +14,7 @@ interface IShellService {
     // Start an activity as the shell user with the caller's activity as its result target;
     // returns "ok" when started, else the reason it was not.
     String startForResult(in Intent intent, IBinder resultTo, int requestCode) = 2;
+    // Copy what src reads into dest (a file under shared storage's Android/obb), creating
+    // its folder; returns "ok" or the reason it failed. For an XAPK's expansion files.
+    String copyIn(in ParcelFileDescriptor src, String dest) = 3;
 }

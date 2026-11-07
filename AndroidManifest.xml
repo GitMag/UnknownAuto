@@ -7,8 +7,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.mag.unknownauto"
-    android:versionCode="4"
-    android:versionName="1.3">
+    android:versionCode="6"
+    android:versionName="1.5">
 
     <!-- Install an APK through the system package installer. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
@@ -36,13 +36,30 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
-            <!-- Open an .apk "with UnknownAuto" from a file manager. -->
+            <!-- Open an .apk or .xapk "with UnknownAuto" from a file manager. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW"/>
                 <category android:name="android.intent.category.DEFAULT"/>
                 <data android:scheme="content"/>
                 <data android:scheme="file"/>
                 <data android:mimeType="application/vnd.android.package-archive"/>
+                <data android:mimeType="application/xapk-package-archive"/>
+            </intent-filter>
+            <!-- Most file managers type an .xapk as octet-stream: match it by its name.
+                 pathPattern stops at the first dot it can't match, hence one per dot count. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:scheme="content"/>
+                <data android:scheme="file"/>
+                <data android:host="*"/>
+                <data android:mimeType="application/octet-stream"/>
+                <data android:pathPattern=".*\\.xapk"/>
+                <data android:pathPattern=".*\\..*\\.xapk"/>
+                <data android:pathPattern=".*\\..*\\..*\\.xapk"/>
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.xapk"/>
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\.xapk"/>
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\.xapk"/>
             </intent-filter>
         </activity>
 

@@ -1,13 +1,16 @@
 package com.mag.unknownauto;
 
 import android.app.Activity;
+import android.app.PendingIntent;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.content.IntentSender;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.InstallSourceInfo;
 import android.content.pm.PackageInfo;
+import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.content.pm.Signature;
 import android.graphics.Color;
@@ -15,7 +18,9 @@ import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.IBinder;
+import android.os.ParcelFileDescriptor;
 import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -28,14 +33,17 @@ import android.widget.Toast;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 
 import org.json.JSONArray;
@@ -71,6 +79,14 @@ import rikka.shizuku.Shizuku;
  *   <li>the intent's data URI (opening an .apk "with UnknownAuto"), or</li>
  *   <li>{@code getExternalFilesDir()/pending.apk} (the Mac helper pushes here).</li>
  * </ol>
+ *
+ * <p>Any of these may also be an .xapk ({@link Xapk}). One holding a single APK installs
+ * like that APK; one split into several APKs installs them together in one install session.
+ * On a rooted phone ({@link Root}) that session is created under Google Play's own account
+ * ({@code su <play-uid> pm install-create}) and committed as root, so even a split gets the
+ * full Android Auto mark; without root it goes through this app's own PackageInstaller,
+ * which Android won't give the Play mark. Expansion files (OBB) are copied to
+ * {@code Android/obb/<package>/}.
  */
 public final class InstallActivity extends Activity {
 
@@ -78,7 +94,10 @@ public final class InstallActivity extends Activity {
     private static final String KOFI_URL = "https://ko-fi.com/forsblomdev";
     private static final int REQ_INSTALL = 1;
     private static final int REQ_PICK = 2;
+    private static final int REQ_SESSION = 4;
     private static final int REQ_SHIZUKU = 3000;
+    private static final String INCOMING = "incoming.apk"; // a picked file, copied into cache
+    private static final String BUNDLE_DIR = "bundle";     // an XAPK's APKs and OBBs, unpacked
 
     private TextView log;
     private TextView banner;        // big, prominent success/failure line
@@ -95,6 +114,11 @@ public final class InstallActivity extends Activity {
     private boolean sawPause;       // the installer actually took the foreground
     private boolean viaShell;       // this attempt launched the installer as shell (Shizuku)
     private boolean retried;        // this install already tried the other launch path
+    private Xapk bundle;            // the loaded XAPK when it has splits or OBBs; else null
+    // Loads (copy, unpack, parse) run here in order, off the UI thread.
+    private final java.util.concurrent.ExecutorService loader =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
+    private boolean splitInstall;   // this install is a split XAPK's session (no Play mark)
 
     /**
      * Remembered per phone: whether the installer keeps the Play mark when the shell
@@ -119,6 +143,10 @@ public final class InstallActivity extends Activity {
         super.onCreate(state);
         buildUi();
         print(deviceLine());
+        if (Root.binaryPresent()) {
+            print("Root (su) detected — a multi-APK XAPK installs with the full Play mark "
+                    + "through it.");
+        }
         try {
             Shizuku.addBinderReceivedListenerSticky(binderListener);
         } catch (Throwable ignore) {
@@ -127,21 +155,37 @@ public final class InstallActivity extends Activity {
         handleIntent();
     }
 
-    /** Handles the current intent (onCreate and onNewIntent): loads any APK, never installs. */
+    /**
+     * Handles the current intent (onCreate and onNewIntent): loads any APK, never installs.
+     * Off the UI thread, as an XAPK can be large; loads run one at a time.
+     */
     private void handleIntent() {
-        File src = resolveSource();
+        final Intent it = getIntent();
+        clearStaged();
+        loader.execute(() -> {
+            final File src = resolveSource(it);
+            final boolean ok = src != null && stage(src);
+            runOnUiThread(() -> afterLoad(it, src, ok));
+        });
+    }
+
+    private void afterLoad(Intent it, File src, boolean ok) {
         if (src == null) {
-            print("No APK loaded yet. Tap “Load APK…” to choose one, "
-                    + "or open an .apk with UnknownAuto.", Color.rgb(0xB0, 0x60, 0x00));
+            print("No APK loaded yet. Tap “Load APK or XAPK…” to choose one, "
+                    + "or open an .apk or .xapk with UnknownAuto.", Color.rgb(0xB0, 0x60, 0x00));
             return;
         }
-        if (!stage(src)) {
+        if (!ok) {
             return;
         }
         // "stage + grant only": stage the APK and grant read to the installer, but
         // let the SHELL (adb / Shizuku) launch the system installer, so the install
         // name com.android.vending is honoured.
-        if (getIntent() != null && getIntent().getBooleanExtra("stageonly", false)) {
+        if (it != null && it.getBooleanExtra("stageonly", false)) {
+            if (isSplit()) {
+                print("stageonly works for a single APK only.", Color.RED);
+                return;
+            }
             grantToInstallers(ApkProvider.uriFor());
             print("\nStaged and granted to the package installer.");
             print("content://" + ApkProvider.AUTHORITY + "/" + ApkProvider.NAME);
@@ -152,7 +196,12 @@ public final class InstallActivity extends Activity {
         if (banner != null) {
             banner.setVisibility(View.GONE);
         }
-        print("Ready. Tap “Install” to install " + stagedLabel + " for Android Auto.");
+        print(readyLine());
+    }
+
+    private String readyLine() {
+        return "Ready. Tap “Install” to install " + stagedLabel
+                + (isSplit() ? "." : " for Android Auto.");
     }
 
     /** Phone, Android version and installer version: what a bug report needs first. */
@@ -182,8 +231,7 @@ public final class InstallActivity extends Activity {
 
     // --- source resolution -------------------------------------------------
 
-    private File resolveSource() {
-        Intent it = getIntent();
+    private File resolveSource(Intent it) {
         String path = it != null ? it.getStringExtra("apk") : null;
         if (path != null) {
             File f = new File(path);
@@ -207,7 +255,7 @@ public final class InstallActivity extends Activity {
 
     /** Copies a content:// or file:// URI into cache so we can parse and serve it. */
     private File copyUri(Uri uri) {
-        File out = new File(getCacheDir(), "incoming.apk");
+        File out = new File(getCacheDir(), INCOMING);
         try (InputStream in = getContentResolver().openInputStream(uri);
              OutputStream os = new FileOutputStream(out)) {
             if (in == null) {
@@ -223,15 +271,90 @@ public final class InstallActivity extends Activity {
 
     // --- staging -----------------------------------------------------------
 
+    /** Loads an APK or an XAPK (told apart by content, not by name). */
     private boolean stage(File src) {
-        staged = new File(getCacheDir(), ApkProvider.NAME);
-        try (InputStream in = new java.io.FileInputStream(src);
-             OutputStream os = new FileOutputStream(staged)) {
-            copy(in, os);
+        print("Loading…");
+        bundle = null;
+        Xapk.deleteTree(new File(getCacheDir(), BUNDLE_DIR));
+        if (Xapk.isBundle(src)) {
+            return stageBundle(src);
+        }
+        boolean ok = stageApk(src, true);
+        updateInstallButton();
+        return ok;
+    }
+
+    /**
+     * Unpacks an XAPK. A single APK is then staged like any APK (Play mark as usual);
+     * several stay unpacked for one session install, which can't carry the Play mark.
+     */
+    private boolean stageBundle(File src) {
+        Xapk x;
+        try {
+            x = Xapk.extract(src, new File(getCacheDir(), BUNDLE_DIR));
         } catch (Exception e) {
-            print("Could not stage the APK: " + e.getMessage(), Color.RED);
+            print("Could not read the XAPK: " + e.getMessage(), Color.RED);
             clearStaged();
             return false;
+        }
+        if (src.equals(new File(getCacheDir(), INCOMING))) {
+            src.delete(); // its contents are unpacked; don't keep the XAPK twice
+        }
+        print("XAPK: " + x.describe());
+        boolean split = x.apks.size() > 1;
+        if (!stageApk(x.base, !split)) {
+            return false;
+        }
+        if (x.packageName != null && !x.packageName.isEmpty()
+                && !x.packageName.equals(targetPackage)) {
+            print("✖ manifest.json names " + x.packageName + " but the base APK is "
+                    + targetPackage + ".", Color.RED);
+            clearStaged();
+            return false;
+        }
+        for (int i = x.obbs.size() - 1; i >= 0; i--) {
+            if (!x.obbs.get(i).pkg.equals(targetPackage)) {
+                print("Ignoring an OBB for another app: " + x.obbs.get(i).pkg,
+                        Color.rgb(0xB0, 0x60, 0x00));
+                x.obbs.remove(i);
+            }
+        }
+        if (!split) {
+            x.base.delete(); // staged as install.apk
+        }
+        bundle = split || !x.obbs.isEmpty() ? x : null;
+        if (split) {
+            print("This XAPK is split into " + x.apks.size() + " APKs. A rooted phone installs "
+                    + "them with the full Google Play mark (the session is created under Google "
+                    + "Play as root); without root Android's installer gives the mark to a single "
+                    + "APK only, so they install together without it.", Color.rgb(0xB0, 0x60, 0x00));
+        }
+        updateInstallButton();
+        return true;
+    }
+
+    /** True if the loaded app is a split XAPK (installed by session, without the mark). */
+    private boolean isSplit() {
+        return bundle != null && bundle.apks.size() > 1;
+    }
+
+    /**
+     * Parses an APK and makes it the loaded app. With {@code copy} it is first copied to
+     * install.apk, the one file ApkProvider serves to the system installer.
+     */
+    private boolean stageApk(File src, boolean copy) {
+        if (copy) {
+            staged = new File(getCacheDir(), ApkProvider.NAME);
+            try (InputStream in = new FileInputStream(src);
+                 OutputStream os = new FileOutputStream(staged)) {
+                copy(in, os);
+            } catch (Exception e) {
+                print("Could not stage the APK: " + e.getMessage(), Color.RED);
+                clearStaged();
+                return false;
+            }
+        } else {
+            staged = src;
         }
         PackageInfo pi = getPackageManager().getPackageArchiveInfo(staged.getAbsolutePath(),
                 signingFlag());
@@ -255,7 +378,6 @@ public final class InstallActivity extends Activity {
         }
         print("Loaded " + stagedLabel + " (" + targetPackage + "), v" + pi.versionName
                 + ", " + (staged.length() / 1024) + " kB");
-        updateInstallButton();
         return true;
     }
 
@@ -536,7 +658,7 @@ public final class InstallActivity extends Activity {
     private void withShell(final ShellCall call, final ShellDone done) {
         final Shizuku.UserServiceArgs args = new Shizuku.UserServiceArgs(
                 new ComponentName(getPackageName(), ShellService.class.getName()))
-                .daemon(false).processNameSuffix("shell").debuggable(false).version(3);
+                .daemon(false).processNameSuffix("shell").debuggable(false).version(4);
         final ServiceConnection conn = new ServiceConnection() {
             @Override
             public void onServiceConnected(ComponentName name, final IBinder binder) {
@@ -683,6 +805,415 @@ public final class InstallActivity extends Activity {
         return in;
     }
 
+    // --- split XAPK: install as root when the phone is rooted ---------------
+
+    /**
+     * Entry point for a split (multi-APK) XAPK. Picks the best path on a background thread:
+     * <ol>
+     *   <li><b>Rooted, Google Play present (full mark):</b> root creates the install session
+     *       under Google Play's own account ({@code su <play-uid> -c 'pm install-create -i
+     *       com.android.vending …'}), then writes the APKs and commits as root. Android
+     *       records Play as BOTH the initiating and the installing package, so even a split
+     *       projects in Android Auto. Writing and committing run as root because a session's
+     *       owner can't stream an APK from a pipe (reverse mode is shell/root only), and the
+     *       install source is fixed at create time, so committing as root doesn't change
+     *       it.</li>
+     *   <li><b>Rooted, no Play (or the above failed):</b> install as root with
+     *       {@code pm install -i com.android.vending} ({@link #rootInstallScript}) —
+     *       installer=Play, but initiating=com.android.shell, so a split won't project on
+     *       API 30+ (installer=Play alone is enough on API &lt; 30).</li>
+     *   <li><b>No root:</b> this app's own PackageInstaller session, no Play mark.</li>
+     * </ol>
+     */
+    private void installSplitBundle() {
+        splitInstall = true;
+        viaShell = false;
+        verifyPending = false; // these paths verify when they return, not via onResume
+        installStartedAt = System.currentTimeMillis();
+        print("Installing " + bundle.apks.size() + " APKs…");
+        new Thread(this::doSplitInstall).start();
+    }
+
+    /** Runs on a worker thread: probe root, then take the best path (see installSplitBundle). */
+    private void doSplitInstall() {
+        final List<File> apks = new ArrayList<>(bundle.apks);
+        final String probe = Root.run("echo UA_ROOT_$(id -u)");
+        if (probe == null || !probe.contains("UA_ROOT_0")) {
+            final boolean denied = probe != null && probe.contains("UA_ROOT_");
+            runOnUiThread(() -> {
+                print(denied ? "Root was denied — installing without the Play mark."
+                             : "No root on this phone — installing without the Play mark.",
+                        Color.rgb(0xB0, 0x60, 0x00));
+                installSplits();
+            });
+            return;
+        }
+        final int vuid = vendingUid();
+        if (vuid > 0) {
+            runOnUiThread(() -> print("Installing as root, under Google Play…"));
+            final String out = Root.run(fullMarkScript(apks, vuid));
+            runOnUiThread(() -> afterFullMark(apks, out));
+        } else {
+            runOnUiThread(() -> {
+                print("Google Play isn't installed; installing as root with the Play installer "
+                        + "name only.", Color.rgb(0xB0, 0x60, 0x00));
+                installSplitsRootPlain(apks);
+            });
+        }
+    }
+
+    /** uid of the Google Play app, or -1 if it isn't installed. */
+    private int vendingUid() {
+        try {
+            return getPackageManager().getPackageUid(VENDING, 0);
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /**
+     * The full-mark root script: create the session as Google Play's uid (so Play is the
+     * initiating package), then write each APK and commit as root — root may stream into and
+     * commit another owner's session, and the install source stays as set at create time.
+     * {@code --user 0} avoids a current-user lookup that Play's uid may not be allowed; it
+     * assumes the owner user (true on an ordinary single-user phone, which is the use case).
+     */
+    private String fullMarkScript(List<File> apks, int vuid) {
+        StringBuilder s = new StringBuilder();
+        s.append("echo UA_ROOT_$(id -u)\n");
+        s.append("SID=$(su ").append(vuid).append(" -c 'pm install-create --user 0 -i ")
+                .append(VENDING)
+                .append(" -r --install-reason 1' | sed -n 's/.*\\[\\([0-9]*\\)\\].*/\\1/p')\n");
+        s.append("[ -z \"$SID\" ] && { echo UA_NOSID; exit 0; }\n");
+        for (File f : apks) {
+            s.append("cat ").append(Root.q(f.getAbsolutePath())).append(" | pm install-write -S ")
+                    .append(f.length()).append(" $SID ").append(Root.q(f.getName()))
+                    .append(" - 2>&1\n");
+        }
+        s.append("pm install-commit $SID 2>&1 && echo UA_OK || echo UA_FAIL\n");
+        return s.toString();
+    }
+
+    /** Result of the full-mark attempt: success -> verify; failure -> installer-name-only root. */
+    private void afterFullMark(List<File> apks, String out) {
+        if (out == null || !out.contains("UA_ROOT_0")) {
+            print("Root was denied — installing without the Play mark.", Color.rgb(0xB0, 0x60, 0x00));
+            installSplits();
+            return;
+        }
+        if (out.contains("UA_OK")) {
+            print("Installed as root, under Google Play.");
+            verify();
+            return;
+        }
+        print("The full Play mark didn't go through; installing as root with the Play installer "
+                + "name only.", Color.rgb(0xB0, 0x60, 0x00));
+        printPmLines(out);
+        installSplitsRootPlain(apks);
+    }
+
+    /** Fallback: install the splits as root with {@code pm install -i vending} (installer only). */
+    private void installSplitsRootPlain(List<File> apks) {
+        print("Installing " + apks.size() + " APKs as root…");
+        new Thread(() -> {
+            final String out = Root.run(rootInstallScript(apks));
+            runOnUiThread(() -> afterRootInstall(apks, out));
+        }).start();
+    }
+
+    /** Prints a root command's output, dropping our markers and empty lines. */
+    private void printPmLines(String out) {
+        if (out == null) {
+            return;
+        }
+        for (String line : out.split("\n")) {
+            String l = line.trim();
+            if (!l.isEmpty() && !l.startsWith("UA_")) {
+                print(l.length() > 240 ? l.substring(0, 240) + "…" : l, Color.DKGRAY);
+            }
+        }
+    }
+
+    /**
+     * The script the plain-root fallback runs: create one install session named as Google
+     * Play, write each APK into it, commit. Markers let afterRootInstall() tell "no root"
+     * from "ran as root but failed".
+     */
+    private String rootInstallScript(List<File> apks) {
+        StringBuilder s = new StringBuilder();
+        s.append("echo UA_ROOT_$(id -u)\n");
+        // Parse the session id from the "[12345]" the installer prints, not every digit in
+        // the output — a warning line to stderr would corrupt a tr -dc '0-9' parse.
+        s.append("sid=$(pm install-create -r -i ").append(VENDING)
+                .append(" --install-reason 1 2>&1 | sed -n 's/.*\\[\\([0-9]*\\)\\].*/\\1/p')\n");
+        s.append("[ -z \"$sid\" ] && { echo UA_FAIL; exit 0; }\n");
+        for (File f : apks) {
+            s.append("pm install-write $sid ").append(Root.q(f.getName())).append(' ')
+                    .append(Root.q(f.getAbsolutePath())).append(" 2>&1\n");
+        }
+        s.append("pm install-commit $sid 2>&1 && echo UA_OK || echo UA_FAIL\n");
+        return s.toString();
+    }
+
+    /** Handles the root install's output: no root -> fall back; else verify the result. */
+    private void afterRootInstall(List<File> apks, String out) {
+        if (out == null || !out.contains("UA_ROOT_0")) {
+            if (out != null && out.contains("UA_ROOT_")) {
+                print("Root was denied — installing the ordinary way (no Play mark).",
+                        Color.rgb(0xB0, 0x60, 0x00));
+            } else {
+                print("No root on this phone — installing the ordinary way (no Play mark).",
+                        Color.rgb(0xB0, 0x60, 0x00));
+            }
+            installSplits(); // app's own PackageInstaller session; shows Android's prompt
+            return;
+        }
+        if (out.contains("UA_OK")) {
+            print("Installed " + apks.size() + " APKs as root.");
+            verify();
+            return;
+        }
+        showBanner("✖  " + stagedLabel + " was not installed\n"
+                + "The root install failed — see details.", Color.RED);
+        print("✖ root install failed:", Color.RED);
+        for (String line : out.split("\n")) {
+            String l = line.trim();
+            if (l.isEmpty() || l.startsWith("UA_")) {
+                continue;
+            }
+            print(l.length() > 240 ? l.substring(0, 240) + "…" : l, Color.DKGRAY);
+        }
+        verify(); // report the real state (usually: still not installed)
+    }
+
+    // --- split XAPK, no root: one PackageInstaller session (no Play mark) ----
+
+    /**
+     * Installs a split XAPK's APKs together in one PackageInstaller session; Android shows
+     * its own install prompt. The system installer app takes a single APK only, so this
+     * can't carry the Google Play mark; verify() says so.
+     */
+    private void installSplits() {
+        if (!ensureInstallPermission()) {
+            return;
+        }
+        final List<File> apks = new ArrayList<>(bundle.apks);
+        final String pkg = targetPackage;
+        // The result comes back to onActivityResult; only the system holds this sender.
+        // Mutable, so the installer can fill in the status.
+        Intent result = new Intent("com.mag.unknownauto.SESSION_RESULT").setPackage(getPackageName());
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT
+                | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0);
+        final IntentSender sender = createPendingResult(REQ_SESSION, result, flags).getIntentSender();
+        splitInstall = true;
+        viaShell = false;
+        verifyPending = false; // the session reports its own result
+        installStartedAt = System.currentTimeMillis();
+        print("Writing " + apks.size() + " APKs into one install…");
+        new Thread(() -> {
+            PackageInstaller installer = getPackageManager().getPackageInstaller();
+            int id = -1;
+            try {
+                PackageInstaller.SessionParams p = new PackageInstaller.SessionParams(
+                        PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+                p.setAppPackageName(pkg);
+                p.setInstallReason(PackageManager.INSTALL_REASON_USER);
+                long size = 0;
+                for (File f : apks) {
+                    size += f.length();
+                }
+                p.setSize(size);
+                id = installer.createSession(p);
+                try (PackageInstaller.Session session = installer.openSession(id)) {
+                    for (File f : apks) {
+                        try (InputStream in = new FileInputStream(f);
+                             OutputStream out = session.openWrite(f.getName(), 0, f.length())) {
+                            copy(in, out);
+                            session.fsync(out);
+                        }
+                    }
+                    session.commit(sender);
+                }
+                runOnUiThread(() -> print("Tap “Install” on the phone…"));
+            } catch (Exception e) {
+                if (id >= 0) {
+                    try {
+                        installer.abandonSession(id);
+                    } catch (Exception ignore) {
+                        // already gone
+                    }
+                }
+                final String why = String.valueOf(e.getMessage());
+                runOnUiThread(() -> {
+                    showBanner("✖  " + stagedLabel + " was not installed\n"
+                            + "Its APKs could not be handed to Android — see details.", Color.RED);
+                    print("Could not write the install: " + why, Color.RED);
+                });
+            }
+        }).start();
+    }
+
+    /** The session's progress: the prompt to show, then its outcome. */
+    @SuppressWarnings("deprecation")
+    private void onSessionResult(Intent data) {
+        if (data == null || !splitInstall) {
+            return;
+        }
+        int status = data.getIntExtra(PackageInstaller.EXTRA_STATUS,
+                PackageInstaller.STATUS_FAILURE);
+        if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+            Intent confirm = data.getParcelableExtra(Intent.EXTRA_INTENT);
+            if (confirm != null) {
+                try {
+                    startActivity(confirm);
+                } catch (Exception e) {
+                    print("Could not open the install prompt: " + e.getMessage(), Color.RED);
+                }
+            }
+            return;
+        }
+        if (status == PackageInstaller.STATUS_SUCCESS) {
+            print("Installed.");
+            verify();
+            return;
+        }
+        String msg = data.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+        boolean cancelled = status == PackageInstaller.STATUS_FAILURE_ABORTED;
+        showBanner("✖  " + stagedLabel + " was not installed\n"
+                + (cancelled ? "The install was cancelled." : "Android refused it — see details."),
+                Color.RED);
+        print("✖ install " + statusName(status) + (msg != null ? ": " + msg : ""), Color.RED);
+        if (!cancelled) {
+            printInstallerLog();
+        }
+    }
+
+    private static String statusName(int status) {
+        switch (status) {
+            case PackageInstaller.STATUS_FAILURE_ABORTED: return "cancelled";
+            case PackageInstaller.STATUS_FAILURE_BLOCKED: return "blocked";
+            case PackageInstaller.STATUS_FAILURE_CONFLICT: return "conflicts with an installed app";
+            case PackageInstaller.STATUS_FAILURE_INCOMPATIBLE: return "incompatible with this phone";
+            case PackageInstaller.STATUS_FAILURE_INVALID: return "invalid";
+            case PackageInstaller.STATUS_FAILURE_STORAGE: return "out of storage";
+            default: return "failed";
+        }
+    }
+
+    // --- XAPK expansion files (OBB) ------------------------------------------
+
+    /**
+     * Copies the XAPK's OBB files to Android/obb/&lt;package&gt;/ once the app is installed.
+     * An app allowed to install apps may write there on current Android; where it may not,
+     * the shell does it through Shizuku.
+     */
+    private void copyObbs() {
+        if (bundle == null || bundle.obbs.isEmpty()) {
+            return;
+        }
+        final List<Xapk.Obb> obbs = new ArrayList<>(bundle.obbs);
+        final File root = new File(Environment.getExternalStorageDirectory(), "Android/obb");
+        print("Copying " + obbs.size() + " OBB file" + (obbs.size() > 1 ? "s" : "")
+                + " to " + root + "/" + targetPackage + "…");
+        new Thread(() -> {
+            final List<Xapk.Obb> left = new ArrayList<>();
+            for (Xapk.Obb o : obbs) {
+                if (!copyObbDirect(o, root)) {
+                    left.add(o);
+                }
+            }
+            runOnUiThread(() -> {
+                if (left.isEmpty()) {
+                    print("OBB files copied.", Color.rgb(0x1B, 0x7A, 0x1B));
+                } else {
+                    copyObbsPrivileged(left, root);
+                }
+            });
+        }).start();
+    }
+
+    /** Writes the OBB files Android refused us, as root if the phone is rooted, else Shizuku. */
+    private void copyObbsPrivileged(final List<Xapk.Obb> obbs, final File root) {
+        new Thread(() -> {
+            final String out = Root.run(obbCopyScript(obbs, root));
+            final boolean ok = out != null && out.contains("UA_ROOT_0") && out.contains("UA_OBB_OK");
+            runOnUiThread(() -> {
+                if (ok) {
+                    print("OBB files copied (as root).", Color.rgb(0x1B, 0x7A, 0x1B));
+                } else if (shizukuReady()) {
+                    copyObbsAsShell(obbs, root);
+                } else {
+                    print("✖ Android didn't let UnknownAuto write the OBB files. Grant root or "
+                            + "start Shizuku, then load the XAPK and install it again.", Color.RED);
+                }
+            });
+        }).start();
+    }
+
+    /** Script a root shell runs to place the expansion files under Android/obb/&lt;package&gt;/. */
+    private String obbCopyScript(List<Xapk.Obb> obbs, File root) {
+        StringBuilder s = new StringBuilder();
+        s.append("echo UA_ROOT_$(id -u)\n");
+        s.append("ok=1\n");
+        for (Xapk.Obb o : obbs) {
+            String dir = new File(root, o.pkg).getAbsolutePath();
+            String dest = new File(new File(root, o.pkg), o.name).getAbsolutePath();
+            s.append("mkdir -p ").append(Root.q(dir)).append(" && cp -f ")
+                    .append(Root.q(o.file.getAbsolutePath())).append(' ').append(Root.q(dest))
+                    .append(" || ok=0\n");
+        }
+        s.append("[ \"$ok\" = 1 ] && echo UA_OBB_OK || echo UA_OBB_FAIL\n");
+        return s.toString();
+    }
+
+    /** Writes one OBB file itself; false if Android doesn't allow it. */
+    private static boolean copyObbDirect(Xapk.Obb o, File root) {
+        File dir = new File(root, o.pkg);
+        File part = new File(dir, o.name + ".part");
+        try {
+            if (!dir.isDirectory() && !dir.mkdirs()) {
+                return false;
+            }
+            try (InputStream in = new FileInputStream(o.file);
+                 OutputStream os = new FileOutputStream(part)) {
+                copy(in, os);
+            }
+            File out = new File(dir, o.name);
+            if (out.exists() && !out.delete()) {
+                part.delete();
+                return false;
+            }
+            return part.renameTo(out);
+        } catch (Exception e) {
+            part.delete();
+            return false;
+        }
+    }
+
+    private void copyObbsAsShell(final List<Xapk.Obb> obbs, final File root) {
+        withShell(s -> {
+            StringBuilder failed = new StringBuilder();
+            for (Xapk.Obb o : obbs) {
+                String r;
+                try (ParcelFileDescriptor fd = ParcelFileDescriptor.open(o.file,
+                        ParcelFileDescriptor.MODE_READ_ONLY)) {
+                    r = s.copyIn(fd, new File(new File(root, o.pkg), o.name).getPath());
+                }
+                if (!"ok".equals(r)) {
+                    failed.append("\n").append(o.name).append(": ").append(r);
+                }
+            }
+            return failed.length() == 0 ? "ok" : failed.toString();
+        }, out -> {
+            if ("ok".equals(out)) {
+                print("OBB files copied (through Shizuku).", Color.rgb(0x1B, 0x7A, 0x1B));
+            } else {
+                print("✖ Could not copy the OBB files:" + (out != null ? out : " Shizuku failed"),
+                        Color.RED);
+            }
+        });
+    }
+
     // --- get Shizuku onto the phone (when it is not installed) --------------
 
     /** Downloads the latest official Shizuku APK and opens the installer for it. */
@@ -796,6 +1327,7 @@ public final class InstallActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        loader.shutdown();
         try {
             Shizuku.removeRequestPermissionResultListener(permListener);
             Shizuku.removeBinderReceivedListener(binderListener);
@@ -808,14 +1340,25 @@ public final class InstallActivity extends Activity {
     @Override
     protected void onActivityResult(int req, int result, Intent data) {
         super.onActivityResult(req, result, data);
+        if (req == REQ_SESSION) {
+            onSessionResult(data);
+            return;
+        }
         if (req == REQ_PICK) {
             if (result == RESULT_OK && data != null && data.getData() != null) {
-                File f = copyUri(data.getData());
-                if (f != null && stage(f)) {
-                    // Load only: stage + enable the Install button, never install here.
-                    banner.setVisibility(View.GONE);
-                    print("Ready. Tap “Install” to install " + stagedLabel + " for Android Auto.");
-                }
+                final Uri uri = data.getData();
+                clearStaged();
+                loader.execute(() -> {
+                    File f = copyUri(uri);
+                    final boolean ok = f != null && stage(f);
+                    runOnUiThread(() -> {
+                        if (ok) {
+                            // Load only: stage + enable the Install button, never install here.
+                            banner.setVisibility(View.GONE);
+                            print(readyLine());
+                        }
+                    });
+                });
             }
             return;
         }
@@ -863,7 +1406,10 @@ public final class InstallActivity extends Activity {
                         Color.rgb(0x1B, 0x7A, 0x1B));
                 toast(label + " installed — Android Auto will accept it");
                 print("✔ Android Auto will accept " + targetPackage, Color.rgb(0x1B, 0x7A, 0x1B));
-                prefs().edit().putBoolean(SHELL_KEEPS_MARK, viaShell).apply();
+                if (!splitInstall) {
+                    prefs().edit().putBoolean(SHELL_KEEPS_MARK, viaShell).apply();
+                }
+                copyObbs();
             } else if (now.lastUpdateTime == installedBefore) {
                 // Nothing was installed: what we read is the old (sideload) record.
                 showBanner("✖  " + label + " was not installed\n"
@@ -871,6 +1417,17 @@ public final class InstallActivity extends Activity {
                 print("✖ nothing was installed — " + label + " still has its old install "
                         + "record (installer=" + installer + ")", Color.RED);
                 printInstallerLog();
+            } else if (splitInstall) {
+                // Expected: a session install can't carry the mark (see installSplits).
+                showBanner("✔  " + label + " installed, without the Google Play mark\n"
+                        + "Android Auto shows it only with Unknown sources on in its developer "
+                        + "settings, and not at all if it's a Car App Library app.",
+                        Color.rgb(0xB0, 0x60, 0x00));
+                print("Installed from a split XAPK without the Play mark (installer=" + installer
+                        + ", initiating=com.android.shell). The full-mark path (create the "
+                        + "session under Google Play as root) wasn't used or fell back. Android "
+                        + "Auto won't project this install.", Color.rgb(0xB0, 0x60, 0x00));
+                copyObbs();
             } else {
                 print("✖ installed without the Play mark (initiator=" + initiating
                         + ", installer=" + installer + ")", Color.RED);
@@ -884,6 +1441,7 @@ public final class InstallActivity extends Activity {
                             + "installer started as shell.", Color.rgb(0xB0, 0x60, 0x00));
                 }
                 printInstallerLog();
+                copyObbs();
             }
         } catch (PackageManager.NameNotFoundException e) {
             showBanner("✖  " + targetPackage + " is not installed", Color.RED);
@@ -917,6 +1475,7 @@ public final class InstallActivity extends Activity {
         stagedInfo = null;
         targetPackage = null;
         stagedLabel = null;
+        bundle = null;
         updateInstallButton();
     }
 
@@ -927,11 +1486,12 @@ public final class InstallActivity extends Activity {
         runOnUiThread(() -> {
             if (targetPackage != null) {
                 installButton.setEnabled(true);
-                installButton.setText("Install " + (stagedLabel != null ? stagedLabel : targetPackage)
-                        + " for Android Auto");
+                String name = stagedLabel != null ? stagedLabel : targetPackage;
+                installButton.setText(isSplit() ? "Install " + name + " (multi-APK)"
+                        : "Install " + name + " for Android Auto");
             } else {
                 installButton.setEnabled(false);
-                installButton.setText("Install for Android Auto (load an APK first)");
+                installButton.setText("Install for Android Auto (load an APK or XAPK first)");
             }
         });
     }
@@ -981,14 +1541,19 @@ public final class InstallActivity extends Activity {
         banner.setVisibility(View.GONE);
         root.addView(banner);
 
-        // 1. Load — pick an APK and stage it; does NOT install.
+        // 1. Load — pick an APK or XAPK and stage it; does NOT install.
         Button load = new Button(this);
-        load.setText("Load APK…");
+        load.setText("Load APK or XAPK…");
         load.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
                 Intent g = new Intent(Intent.ACTION_OPEN_DOCUMENT);
                 g.addCategory(Intent.CATEGORY_OPENABLE);
-                g.setType("application/vnd.android.package-archive");
+                // Android has no type for .xapk: the picker lists it as octet-stream.
+                g.setType("*/*");
+                g.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
+                        "application/vnd.android.package-archive",
+                        "application/xapk-package-archive",
+                        "application/octet-stream", "application/zip"});
                 startActivityForResult(g, REQ_PICK);
             }
         });
@@ -999,13 +1564,18 @@ public final class InstallActivity extends Activity {
         installButton.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
                 if (staged == null || targetPackage == null) {
-                    print("Nothing loaded. Tap “Load APK…” first.",
+                    print("Nothing loaded. Tap “Load APK or XAPK…” first.",
                             Color.rgb(0xB0, 0x60, 0x00));
                     return;
                 }
                 banner.setVisibility(View.GONE);
                 retried = false;
+                splitInstall = false;
                 if (!preflight()) {
+                    return;
+                }
+                if (isSplit()) {
+                    installSplitBundle();
                     return;
                 }
                 // Shell first (what current Android keeps the mark for), unless this phone
