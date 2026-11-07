@@ -44,7 +44,7 @@ installer's own log lines, which is the most useful thing to paste into an issue
 
 ## Install UnknownAuto
 
-Grab **UnknownAuto‑1.3.apk** from the [latest release](https://github.com/GitMag/UnknownAuto/releases/latest)
+Grab the latest **UnknownAuto APK** from the [latest release](https://github.com/GitMag/UnknownAuto/releases/latest)
 and open it on the phone — or build it yourself with plain Android SDK tools, no Gradle:
 
 ```
