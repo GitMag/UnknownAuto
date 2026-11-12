@@ -12,6 +12,7 @@ import android.content.pm.InstallSourceInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.content.pm.Signature;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -91,6 +92,8 @@ import rikka.shizuku.Shizuku;
 public final class InstallActivity extends Activity {
 
     private static final String VENDING = "com.android.vending";
+    private static final String GOOGLE_INSTALLER = "com.google.android.packageinstaller";
+    private static final String AOSP_INSTALLER = "com.android.packageinstaller";
     private static final String KOFI_URL = "https://ko-fi.com/forsblomdev";
     private static final int REQ_INSTALL = 1;
     private static final int REQ_PICK = 2;
@@ -108,10 +111,11 @@ public final class InstallActivity extends Activity {
     private File staged;            // cacheDir/install.apk
     private PackageInfo stagedInfo; // the staged APK as parsed (version, signing key)
     private long installedBefore;   // target's lastUpdateTime before this install; 0 = absent
-    private long installStartedAt;  // when the installer was launched (start of its log)
+    private long installStartedAt;  // when this install's first try began (start of its log)
     private boolean awaitingBinder; // staged and waiting for Shizuku's binder to connect
     private boolean verifyPending;  // an install was launched; verify when we come back
     private boolean sawPause;       // the installer actually took the foreground
+    private int launchGen;          // bumped per installer launch: a verify queued earlier is dropped
     private boolean viaShell;       // this attempt launched the installer as shell (Shizuku)
     private boolean retried;        // this install already tried the other launch path
     private Xapk bundle;            // the loaded XAPK when it has splits or OBBs; else null
@@ -206,21 +210,66 @@ public final class InstallActivity extends Activity {
 
     /** Phone, Android version and installer version: what a bug report needs first. */
     private String deviceLine() {
+        ComponentName sys = systemInstallerActivity();
         String pi;
-        try {
-            pi = getPackageManager().getPackageInfo("com.google.android.packageinstaller", 0)
-                    .versionName;
-        } catch (Throwable t) {
-            pi = "?";
+        if (sys == null) {
+            pi = "none found";
+        } else {
+            try {
+                pi = getPackageManager().getPackageInfo(sys.getPackageName(), 0).versionName;
+            } catch (Throwable t) {
+                pi = "?";
+            }
+            pi = (GOOGLE_INSTALLER.equals(sys.getPackageName()) ? "" : sys.getPackageName() + " ")
+                    + pi;
         }
         return Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE
                 + " (SDK " + Build.VERSION.SDK_INT + "), package installer " + pi + "\n";
     }
 
+    /**
+     * The system package installer's entry activity, which the shell starts by name:
+     * Google's, else AOSP's (GrapheneOS, LineageOS and other builds without Google's), else
+     * the phone maker's own. Null if no system app takes APK installs. Some phones ship
+     * Google's installer package with its entry activity removed or turned off; naming it
+     * there fails with "Activity class … does not exist" (startActivity −92).
+     */
+    private ComponentName systemInstallerActivity() {
+        Intent probe = new Intent(Intent.ACTION_INSTALL_PACKAGE);
+        probe.setDataAndType(ApkProvider.uriFor(), "application/vnd.android.package-archive");
+        List<ResolveInfo> handlers;
+        try {
+            handlers = getPackageManager().queryIntentActivities(probe,
+                    PackageManager.MATCH_DEFAULT_ONLY);
+        } catch (Throwable t) {
+            return null;
+        }
+        ComponentName best = null;
+        int bestRank = Integer.MAX_VALUE;
+        for (ResolveInfo ri : handlers) {
+            String p = ri.activityInfo.packageName;
+            if (!isSystemApp(p)) {
+                continue;
+            }
+            int rank = GOOGLE_INSTALLER.equals(p) ? 0 : AOSP_INSTALLER.equals(p) ? 1 : 2;
+            if (rank < bestRank) {
+                best = new ComponentName(p, ri.activityInfo.name);
+                bestRank = rank;
+            }
+        }
+        return best;
+    }
+
     /** Grants read on the staged-APK URI to the system package installers. */
     private void grantToInstallers(Uri uri) {
-        for (String p : new String[]{"com.google.android.packageinstaller",
-                "com.android.packageinstaller", VENDING}) {
+        // the shell path can't put a grant flag on its intent: grant the phone maker's
+        // installer here too, when that is the one that takes installs
+        ComponentName sys = systemInstallerActivity();
+        for (String p : new String[]{GOOGLE_INSTALLER, AOSP_INSTALLER, VENDING,
+                sys == null ? null : sys.getPackageName()}) {
+            if (p == null) {
+                continue;
+            }
             try {
                 grantUriPermission(p, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
             } catch (Exception ignore) {
@@ -490,17 +539,101 @@ public final class InstallActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 34) {
             in.putExtra("android.content.pm.extra.REQUEST_UPDATE_OWNERSHIP", true);
         }
+        String pinned = systemInstallerFor(in);
+        if (pinned != null) {
+            in.setPackage(pinned);
+        }
 
         try {
             verifyPending = true;
             sawPause = false;
             viaShell = false;
-            installStartedAt = System.currentTimeMillis();
+            launchGen++;
+            if (!retried) { // a retry keeps the first try's start, so the log shows both
+                installStartedAt = System.currentTimeMillis();
+            }
             startActivityForResult(in, REQ_INSTALL);
             print("Tap “Install” on the phone…");
         } catch (Exception e) {
             print("No system installer handled the request: " + e.getMessage(), Color.RED);
         }
+    }
+
+    /**
+     * The installer the install intent must go to, or null to let Android pick as it always
+     * has. Null whenever only system installers take APK installs. A third-party installer
+     * app (InstallerX and the like) may be set as the default for them, and its installs
+     * never carry the Play mark: it installs as itself, or through Shizuku as the shell.
+     * Then the intent names the system installer: Google's, else AOSP's, else another one.
+     */
+    private String systemInstallerFor(Intent in) {
+        List<ResolveInfo> handlers;
+        try {
+            handlers = getPackageManager().queryIntentActivities(in,
+                    PackageManager.MATCH_DEFAULT_ONLY);
+        } catch (Throwable t) {
+            return null;
+        }
+        List<String> others = new ArrayList<>();
+        for (ResolveInfo ri : handlers) {
+            String p = ri.activityInfo.packageName;
+            if (!isSystemApp(p) && !others.contains(p)) {
+                others.add(p);
+            }
+        }
+        if (others.isEmpty()) {
+            return null;
+        }
+        StringBuilder names = new StringBuilder();
+        for (String p : others) {
+            names.append(names.length() > 0 ? ", " : "").append(appName(p));
+        }
+        ComponentName sys = systemInstallerActivity();
+        String pick = sys == null ? null : sys.getPackageName();
+        if (pick == null) {
+            print(names + " is the only APK installer on this phone; its installs can't get "
+                    + "the Play mark.", Color.rgb(0xB0, 0x60, 0x00));
+        } else {
+            print(names + " also installs APKs on this phone; using the system installer ("
+                    + pick + ") instead, since only it can give the Play mark.");
+        }
+        return pick;
+    }
+
+    private boolean isSystemApp(String pkg) {
+        try {
+            return (getPackageManager().getApplicationInfo(pkg, 0).flags
+                    & ApplicationInfo.FLAG_SYSTEM) != 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** An app's label, or its package name if it has none or isn't installed. */
+    private String appName(String pkg) {
+        try {
+            PackageManager pm = getPackageManager();
+            return pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString();
+        } catch (Throwable t) {
+            return pkg;
+        }
+    }
+
+    /**
+     * Names the installer app that did this install when it wasn't the system installer
+     * ("" when its name isn't recorded), else null. On the app path the system installer
+     * always records itself as the initiator, so the shell there means an app like
+     * InstallerX installed it through Shizuku.
+     */
+    private String thirdPartyInstaller(String initiating, String installer) {
+        if (installer != null && !VENDING.equals(installer)
+                && !"com.android.shell".equals(installer) && !isSystemApp(installer)) {
+            return appName(installer);
+        }
+        if (!viaShell && "com.android.shell".equals(initiating)) {
+            return "";
+        }
+        return null;
     }
 
     @Override
@@ -518,7 +651,12 @@ public final class InstallActivity extends Activity {
             verifyPending = false;
             sawPause = false;
             // let PackageManager settle after the install completes
-            new android.os.Handler(getMainLooper()).postDelayed(this::verify, 600);
+            final int gen = launchGen;
+            new android.os.Handler(getMainLooper()).postDelayed(() -> {
+                if (gen == launchGen) {
+                    verify();
+                }
+            }, 600);
         }
     }
 
@@ -609,33 +747,62 @@ public final class InstallActivity extends Activity {
         if (asResult && !ensureInstallPermission()) {
             return;
         }
+        ComponentName target = systemInstallerActivity();
+        if (target == null) {
+            print("No system package installer takes APK installs on this phone.",
+                    Color.rgb(0xB0, 0x60, 0x00));
+            shellLaunchFailed();
+            return;
+        }
         grantToInstallers(ApkProvider.uriFor());
-        print("asking Shizuku to run the installer as shell…");
+        print("asking Shizuku to run the installer (" + target.getPackageName() + ") as shell…");
         print("tap Update / Install if it asks (and “Install anyway” if Play Protect asks)…");
         verifyPending = true;
         sawPause = false;
         viaShell = true;
-        installStartedAt = System.currentTimeMillis();
+        launchGen++;
+        if (!retried) { // a retry keeps the first try's start, so the log shows both
+            installStartedAt = System.currentTimeMillis();
+        }
         if (asResult) {
-            final Intent in = shellInstallIntent();
+            final Intent in = shellInstallIntent(target);
             final IBinder self = getWindow().getAttributes().token; // this activity's token
             withShell(s -> s.startForResult(in, self, REQ_INSTALL), out -> {
                 if ("ok".equals(out)) {
                     print("Installer launched as shell.");
                 } else {
-                    verifyPending = false;
                     print("Installer launch failed: " + out, Color.RED);
+                    shellLaunchFailed();
                 }
             });
             return;
         }
-        shell(installerCommand(), out -> {
+        shell(installerCommand(target), out -> {
             if (out == null || out.contains("Error") || out.contains("[exit ")) {
                 print("Installer launch failed: " + out, Color.RED);
+                shellLaunchFailed();
             } else {
                 print("Installer launched as shell.");
             }
         });
+    }
+
+    /**
+     * The shell couldn't start the installer at all: install the normal way instead (once),
+     * where Android picks the installer itself. The verify step then says whether this
+     * phone kept the Play mark.
+     */
+    private void shellLaunchFailed() {
+        verifyPending = false;
+        launchGen++; // drop a verify queued by the failed launch's cancelled result
+        if (retried) {
+            return;
+        }
+        retried = true;
+        print("Trying the installer the normal way…", Color.rgb(0xB0, 0x60, 0x00));
+        if (ensureInstallPermission()) {
+            launchInstaller();
+        }
     }
 
     private interface ShellDone {
@@ -750,7 +917,7 @@ public final class InstallActivity extends Activity {
                 + pattern + "'"}, out -> {
             print("\ninstaller log:");
             String[] lines = out == null ? new String[0] : out.trim().split("\n");
-            int from = Math.max(0, lines.length - 40); // the last 40 lines hold the outcome
+            int from = Math.max(0, lines.length - 80); // the outcome of both tries, if retried
             for (int i = from; i < lines.length; i++) {
                 String l = lines[i];
                 if (!l.isEmpty() && !l.startsWith("[exit ")) {
@@ -772,12 +939,12 @@ public final class InstallActivity extends Activity {
             + "|InstallInstalling|InstallLaunch|PackageInstaller|PackageInstallerSession) *:"
             + "|INSTALL_FAILED|VerifyApps|Play Protect";
 
-    /** argv the shell runs: launch the Google installer against our content URI, Play-tagged. */
-    private String[] installerCommand() {
+    /** argv the shell runs: launch the system installer against our content URI, Play-tagged. */
+    private String[] installerCommand(ComponentName installer) {
         String uri = ApkProvider.uriFor().toString();
         return new String[]{
                 "/system/bin/am", "start",
-                "-n", "com.google.android.packageinstaller/com.android.packageinstaller.InstallStart",
+                "-n", installer.flattenToString(),
                 "-a", "android.intent.action.INSTALL_PACKAGE",
                 "-d", uri,
                 "-t", "application/vnd.android.package-archive",
@@ -789,13 +956,12 @@ public final class InstallActivity extends Activity {
     }
 
     /**
-     * The same launch as {@link #installerCommand()}, as an Intent the shell starts for a
+     * The same launch as {@link #installerCommand}, as an Intent the shell starts for a
      * result. No URI-grant flag: the shell can't grant our URI (grantToInstallers did).
      */
-    private Intent shellInstallIntent() {
+    private Intent shellInstallIntent(ComponentName installer) {
         Intent in = new Intent(Intent.ACTION_INSTALL_PACKAGE);
-        in.setComponent(new ComponentName("com.google.android.packageinstaller",
-                "com.android.packageinstaller.InstallStart"));
+        in.setComponent(installer);
         in.setDataAndType(ApkProvider.uriFor(), "application/vnd.android.package-archive");
         in.putExtra("android.intent.extra.INSTALLER_PACKAGE_NAME", VENDING);
         in.putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true);
@@ -1431,6 +1597,16 @@ public final class InstallActivity extends Activity {
             } else {
                 print("✖ installed without the Play mark (initiator=" + initiating
                         + ", installer=" + installer + ")", Color.RED);
+                String other = thirdPartyInstaller(initiating, installer);
+                if (other != null) {
+                    String app = other.isEmpty() ? "the installer app you use" : other;
+                    print("The install was done by " + (other.isEmpty()
+                            ? "another installer app" : other) + ", not by the system package "
+                            + "installer, so it can't carry the Play mark. Turn off " + app
+                            + " as the default APK installer (in its own settings, or Settings → "
+                            + "Apps → " + app + " → Set as default → Clear defaults) and tap "
+                            + "Install again.", Color.rgb(0xB0, 0x60, 0x00));
+                }
                 if (!retried && tryOtherPath(now)) {
                     return;
                 }

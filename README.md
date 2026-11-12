@@ -120,6 +120,9 @@ For any app you want in the car:
 The technical output is tucked behind a **Show details** toggle; the result banner is
 always visible.
 
+Only the phone's own system installer can give the Play mark. If you also use an installer
+app such as InstallerX, UnknownAuto goes past it to the system installer, so you can keep it.
+
 ### XAPK files
 
 An `.xapk` is a zip that holds an app's APKs and, for some games, extra data (OBB files).
